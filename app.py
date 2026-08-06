@@ -2,18 +2,16 @@
 app.py
 ======
 Interfaz gráfica de la Web App de Scraping de Literatura Clínica.
-Permite realizar búsquedas en español, autotraducirlas al inglés para optimizar consultas en APIs médicas,
+Permite realizar búsquedas en español, traducirlas al inglés para optimizar consultas en APIs médicas,
 descargar los PDFs y archivos suplementarios de Zenodo/PubMed Central en un entorno temporal,
 y empaquetarlos en un archivo .ZIP comprimido para su descarga.
 """
 
-import os
 import tempfile
 import zipfile
-import shutil
 from pathlib import Path
 import streamlit as st
-from deep_translator import GoogleTranslator
+import requests
 
 # Configurar layout de la página
 st.set_page_config(
@@ -25,6 +23,25 @@ st.set_page_config(
 
 # Importar motor de descarga local
 from scraper import ejecutar_scraper
+
+
+def traducir_consulta_es_en(texto_consulta: str) -> str:
+    """
+    Traduce texto de español a inglés usando un endpoint HTTP público.
+    Si la traducción falla, se debe manejar la excepción en el flujo principal.
+    """
+    url_traduccion = "https://api.mymemory.translated.net/get"
+    parametros = {"q": texto_consulta, "langpair": "es|en"}
+    respuesta = requests.get(url_traduccion, params=parametros, timeout=20)
+    respuesta.raise_for_status()
+    datos_respuesta = respuesta.json()
+    texto_traducido = (
+        datos_respuesta.get("responseData", {}).get("translatedText", "").strip()
+    )
+    if not texto_traducido:
+        raise ValueError("La API de traducción respondió sin texto traducido.")
+    return texto_traducido
+
 
 # =============================================================================
 # INYECCIÓN DE ESTILOS CSS PERSONALIZADOS (Aesthetics & Design)
@@ -172,10 +189,13 @@ if st.button("🚀 Iniciar Búsqueda y Descarga"):
         # 1. TRADUCCIÓN AUTOMÁTICA
         with st.spinner("Traduciendo búsqueda al inglés..."):
             try:
-                translated_query = GoogleTranslator(source='es', target='en').translate(query)
+                translated_query = traducir_consulta_es_en(query)
                 st.info(f"✨ **Traducción optimizada para base de datos:** '{translated_query}'")
-            except Exception as e:
-                st.warning(f"No se pudo conectar al traductor ({e}). Se utilizará la consulta original: '{query}'")
+            except (requests.RequestException, ValueError, TypeError) as error_traduccion:
+                st.warning(
+                    f"No se pudo conectar al traductor ({error_traduccion}). "
+                    f"Se utilizará la consulta original: '{query}'"
+                )
                 translated_query = query
         
         # 2. PROCESO DE DESCARGA
@@ -207,8 +227,8 @@ if st.button("🚀 Iniciar Búsqueda y Descarga"):
                                 if file_in_temp.is_file():
                                     zipf.write(file_in_temp, arcname=file_in_temp.name)
                         st.success("✅ Compresión finalizada con éxito.")
-                    except Exception as e:
-                        st.error(f"Error comprimiendo archivos: {e}")
+                    except (OSError, ValueError, RuntimeError, zipfile.BadZipFile) as error_compresion:
+                        st.error(f"Error comprimiendo archivos: {error_compresion}")
                         zip_filepath = None
                 
                 status_box.update(label="¡Búsqueda y Descarga Completadas!", state="complete", expanded=False)

@@ -13,7 +13,8 @@ import tarfile
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Optional
+from urllib.error import HTTPError, URLError
 import requests
 from Bio import Entrez
 
@@ -21,8 +22,16 @@ from Bio import Entrez
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scraper")
 
-# Configurar el correo para Entrez (NCBI lo requiere)
-Entrez.email = os.environ.get("NCBI_EMAIL", "ronaldonavarro3005@gmail.com")
+# Configurar el correo para Entrez (NCBI lo requiere).
+# Se evita dejar datos personales hardcodeados en el código fuente.
+correo_ncbi = os.environ.get("NCBI_EMAIL", "").strip()
+if not correo_ncbi:
+    correo_ncbi = "no-reply@example.com"
+    logger.warning(
+        "NCBI_EMAIL no está definido. Se usará un correo genérico; "
+        "configura NCBI_EMAIL para producción."
+    )
+Entrez.email = correo_ncbi
 NCBI_API_KEY = os.environ.get("NCBI_API_KEY", "")
 if NCBI_API_KEY:
     Entrez.api_key = NCBI_API_KEY
@@ -33,10 +42,41 @@ SLEEP_INTERVAL = 1.0
 
 HTTP_HEADERS = {
     "User-Agent": (
-        f"AgnosticScienceScraper/4.0 (mailto:{Entrez.email}; "
+        f"AgnosticScienceScraper/4.0 (mailto:{correo_ncbi}; "
         "Local Streamlit Research Pipeline)"
     )
 }
+
+
+def _normalizar_nombre_archivo(nombre_original: str) -> str:
+    """Normaliza nombres para guardar archivos de forma segura y portable."""
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in nombre_original)
+
+
+def _miembro_tar_es_seguro(directorio_base: Path, miembro: tarfile.TarInfo) -> bool:
+    """
+    Valida que cada miembro del .tar no salga del directorio base y que
+    no use symlinks/hardlinks potencialmente peligrosos.
+    """
+    if miembro.issym() or miembro.islnk():
+        return False
+
+    ruta_base_resuelta = directorio_base.resolve()
+    ruta_destino = (directorio_base / miembro.name).resolve()
+    try:
+        ruta_destino.relative_to(ruta_base_resuelta)
+        return True
+    except ValueError:
+        return False
+
+
+def _extraer_tar_seguro(archivo_tar: tarfile.TarFile, directorio_destino: Path) -> None:
+    """Extrae solo miembros seguros para mitigar path traversal."""
+    for miembro in archivo_tar.getmembers():
+        if not _miembro_tar_es_seguro(directorio_destino, miembro):
+            logger.warning(f"Miembro inseguro omitido del tar: {miembro.name}")
+            continue
+        archivo_tar.extract(miembro, path=directorio_destino)
 
 
 def descargar_archivo(url: str, destino: Path) -> bool:
@@ -52,7 +92,7 @@ def descargar_archivo(url: str, destino: Path) -> bool:
         else:
             logger.error(f"Error {response.status_code} al descargar de {url}")
             return False
-    except Exception as e:
+    except (requests.RequestException, OSError) as e:
         logger.error(f"Excepción al descargar de {url}: {e}")
         return False
 
@@ -94,8 +134,8 @@ def buscar_y_descargar_zenodo(query: str, temp_dir: Path, max_results: int = 5) 
                     continue
                 
                 # Nombre limpio para evitar colisiones
-                safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
-                filename = f"zenodo_{record_id}_{safe_name}"
+                nombre_seguro = _normalizar_nombre_archivo(name)
+                filename = f"zenodo_{record_id}_{nombre_seguro}"
                 target_path = temp_dir / filename
                 
                 logger.info(f"[Zenodo] Descargando '{name}'...")
@@ -104,7 +144,7 @@ def buscar_y_descargar_zenodo(query: str, temp_dir: Path, max_results: int = 5) 
                     logger.info(f"[Zenodo] Archivo descargado con éxito: {filename}")
                     time.sleep(SLEEP_INTERVAL)
                     
-    except Exception as e:
+    except (requests.RequestException, ValueError) as e:
         logger.error(f"[Zenodo] Error general en búsqueda/descarga: {e}")
         
     return descargados
@@ -139,7 +179,7 @@ def obtener_detalles_pmc(pmcid: str) -> Tuple[str, List[str]]:
                         break
             if href and href.strip().lower().endswith(TARGET_EXTENSIONS):
                 archivos_suplementarios.append(href.strip())
-    except Exception as e:
+    except (RuntimeError, ET.ParseError, ValueError, OSError, HTTPError, URLError) as e:
         logger.error(f"[{pmcid}] Error leyendo XML de efetch: {e}")
     return titulo, archivos_suplementarios
 
@@ -163,7 +203,7 @@ def consultar_pmc_oa_tgz_url(pmcid: str) -> Optional[str]:
                 if href.startswith("ftp://"):
                     href = "https://" + href[len("ftp://"):]
                 return href
-    except Exception as e:
+    except (requests.RequestException, ET.ParseError, ValueError) as e:
         logger.error(f"[{pmcid}] Error en PMC OA Web Service: {e}")
     return None
 
@@ -194,8 +234,8 @@ def descargar_y_extraer_pmc(pmcid: str, url_tgz: str, target_dir: Path, target_n
             tgz_path = Path(tmp_dir) / f"{pmcid}.tar.gz"
             tgz_path.write_bytes(response.content)
             
-            with tarfile.open(tgz_path, "r:gz") as tar:
-                tar.extractall(path=tmp_dir)
+            with tarfile.open(tgz_path, "r:gz") as archivo_tar:
+                _extraer_tar_seguro(archivo_tar, Path(tmp_dir))
                 
             extracted_files = [f for f in Path(tmp_dir).rglob("*") if f.is_file()]
             
@@ -221,14 +261,14 @@ def descargar_y_extraer_pmc(pmcid: str, url_tgz: str, target_dir: Path, target_n
                         is_candidate = any(t_name.lower() in f.name.lower() or f.name.lower() in t_name.lower() for t_name in target_names)
                     
                     if is_candidate:
-                        safe_f_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in f.name)
-                        dest_file_name = f"pmc_{pmcid}_{safe_f_name}"
+                        nombre_seguro = _normalizar_nombre_archivo(f.name)
+                        dest_file_name = f"pmc_{pmcid}_{nombre_seguro}"
                         destino_file = target_dir / dest_file_name
                         destino_file.write_bytes(f.read_bytes())
                         descargados.append(destino_file)
                         logger.info(f"[{pmcid}] Archivo de datos extraído: {dest_file_name}")
                         
-    except Exception as e:
+    except (requests.RequestException, tarfile.TarError, OSError, ValueError) as e:
         logger.error(f"[{pmcid}] Error extrayendo archivos del tgz: {e}")
         
     return descargados
@@ -267,7 +307,7 @@ def buscar_y_descargar_pmc(query: str, temp_dir: Path, max_results: int = 5) -> 
             files_desc = descargar_y_extraer_pmc(pmcid, url_tgz, temp_dir, files_suplementarios, title)
             descargados.extend(files_desc)
             
-    except Exception as e:
+    except (RuntimeError, ValueError, OSError, HTTPError, URLError) as e:
         logger.error(f"[PMC] Error general en búsqueda de PubMed Central: {e}")
         
     return descargados
